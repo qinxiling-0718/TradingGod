@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# DuckDB database (large binary, regeneratable from scripts)
+data/trading_god.duckdb
+*.duckdb
+
+# Environment secrets
+.env
+.env.local
+*.token
+
+# Tushare token (do NOT commit)
+TUSHARE_TOKEN
+
+# Data cache (regeneratable)
+data/cache/
+
+# Temp files
+/tmp/
+*.tmp
+*.log

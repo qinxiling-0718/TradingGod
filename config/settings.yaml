@@ -1,0 +1,60 @@
+# TradingGod Configuration
+# Core settings for data, factors, backtesting
+
+data:
+  # Primary data source: akshare, tushare, or mock
+  primary_source: akshare
+
+  # Local database path
+  db_path: "data/trading_god.duckdb"
+
+  # Data update frequency
+  update_schedule:
+    market_daily: "17:00"    # After market close
+    macro_check: "weekly"     # Weekly macro data check
+    financial_report: "quarterly"  # Quarterly financial reports
+
+  # Tushare token (set via env var TUSHARE_TOKEN)
+  # tushare_token: ${TUSHARE_TOKEN}
+
+factors:
+  # Factor storage
+  registry_path: "config/factors.yaml"
+
+  # Default lookback windows (in weeks)
+  windows:
+    short: 12
+    medium: 26
+    long: 52
+
+  # Expectation gap thresholds
+  expectation_gap:
+    signal_threshold: 1.0    # Z-score threshold for signal
+    decay_factor: 0.85       # Decay weight for older observations
+
+backtest:
+  # Default backtest settings
+  default_frequency: "weekly"  # W (weekly) primary
+  benchmark: "000300"          # CSI 300 as default benchmark
+  initial_capital: 10000000    # 10M default capital
+
+  # Constraints
+  constraints:
+    max_position_pct: 0.15     # Max 15% per position
+    max_sector_pct: 0.30       # Max 30% per sector
+    max_turnover: 0.50         # Max 50% turnover per rebalance
+
+analysis:
+  # Prosperity scoring dimensions
+  dimensions:
+    - profit_cycle      # 盈利周期
+    - macro_cycle        # 宏观周期
+    - inventory_cycle    # 库存周期
+    - valuation_match    # 估值匹配
+    - capital_flow       # 资金行为
+    - policy_force       # 政策力度
+
+  # Deduction engine
+  deduction:
+    chain_depth: 3        # Max chain depth
+    confidence_boost: 1.5  # Multiplier when multiple sources agree
