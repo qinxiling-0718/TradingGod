@@ -1,276 +1,238 @@
-"""Single stock deep analysis — expectation gap report.
+"""Single or multi-stock deep analysis — PEG + PRG + dispersion + trap.
 
-Usage:  uv run python scripts/analyze_stock.py <stock_code>
-Example: uv run python scripts/analyze_stock.py 002463
+Usage:
+  uv run python scripts/analyze_stock.py 002463              # single
+  uv run python scripts/analyze_stock.py 002463 300502       # multi
+  uv run python scripts/analyze_stock.py 002463 300502 688041 # compare N stocks
 """
 
-import sys
-import time
-from pathlib import Path
+import sys, time
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent))
 
 import akshare as ak
-import numpy as np
 import pandas as pd
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import numpy as np
 from data.store.duckdb_store import DuckDBStore
 from factors.metadata_annotator import _detect_peg_trap, PegTrapType
+from factors.dispersion_factor import compute_dispersion_signals, DispersionQuadrant
 
 store = DuckDBStore("data/trading_god.duckdb")
 
+# ── Helpers ────────────────────────────────────────────────────────
 
-def main():
-    code = sys.argv[1] if len(sys.argv) > 1 else "002463"
-    analyze(code)
+def parse_pct(raw):
+    if not raw or raw in ('False','None','nan',''): return None
+    try: return float(str(raw).replace('%','').replace('+','').strip())/100.0
+    except: return None
 
+SW_PE_MAP = {
+    "半导体": "801081.SI", "电子": "801080.SI", "元器件": "801080.SI",
+    "计算机": "801101.SI", "IT设备": "801101.SI", "软件": "801101.SI",
+    "通信设备": "801102.SI", "通信": "801102.SI",
+    "传媒": "801760.SI", "医药": "801150.SI", "军工": "801740.SI",
+    "有色": "801050.SI", "汽车": "801110.SI", "化工": "801030.SI",
+    "机械": "801070.SI", "电气": "801730.SI", "综合": "801080.SI",
+}
 
-def analyze(code: str):
-    # ── Load data ──
-    fc = store.read_df("analyst_forecast")
-    stock_fc = fc[fc["symbol"] == code].sort_values(fc.columns[0])
-    name = stock_fc["name"].iloc[0] if not stock_fc.empty else code
-
-    # Financial actuals
-    time.sleep(2)
-    try:
-        fin = ak.stock_financial_abstract_ths(symbol=code)
-    except Exception:
-        fin = None
-
-    # PE data
+def get_pe(sw_code):
     pe_df = store.read_df("sw_industry_pe_daily")
-    elec_pe = pe_df[pe_df["ts_code"] == "801080.SI"]
+    sec = pe_df[pe_df["ts_code"] == sw_code]
+    if sec.empty: return 0, 0
+    pec = "pe" if "pe" in sec.columns else [c for c in sec.columns if "pe" in c.lower()][0]
+    pv = pd.to_numeric(sec[pec], errors="coerce").dropna()
+    return float(pv.iloc[-1]), float(pv.median())
 
-    # ── Print report ──
-    print("=" * 62)
-    print(f"  {name} ({code}.SZ) — AI PCB Expectation Gap Analysis")
-    print("=" * 62)
+def get_sector_pe(industry, code):
+    if code.startswith("688"): return get_pe("801081.SI")
+    sw = SW_PE_MAP.get(industry)
+    if not sw: return get_pe("801080.SI")
+    return get_pe(sw)
 
-    # 1. Analyst Forecast
-    print("\n  [1] Consensus EPS Forecast (THS)")
-    print("  " + "-" * 52)
-    if stock_fc.empty:
-        print("  No forecast data available.")
-        return
+# ── Stock Analysis ─────────────────────────────────────────────────
 
-    cols = list(stock_fc.columns)
+def analyze(code):
+    """Fetch and analyze a single stock. Returns dict of metrics."""
+    time.sleep(1.5)
+
+    # Forecast
+    try:
+        fc = ak.stock_profit_forecast_ths(symbol=code)
+        if fc is None or fc.empty: return None
+        fc = fc.sort_values(fc.columns[0])
+    except Exception:
+        return None
+
+    latest = fc.iloc[-1]; prior = fc.iloc[-2]
+    eps_next = float(latest.iloc[3]); eps_curr = float(prior.iloc[3])
+    eps_growth = (eps_next / eps_curr - 1) if eps_curr > 0 else 0
+    n_analysts = int(latest.iloc[1])
+    eps_disp = (float(latest.iloc[4]) - float(latest.iloc[2])) / eps_next if eps_next > 0 else 0
+
+    # Growth trend
     growth_rates = []
-    for i, (_, r) in enumerate(stock_fc.iterrows()):
-        y, n, lo, mean, hi, ind = r.iloc[0], r.iloc[1], r.iloc[2], r.iloc[3], r.iloc[4], r.iloc[5]
-        disp = (hi - lo) / mean if mean > 0 else 0
-        if i > 0:
-            prev_mean = float(stock_fc.iloc[i - 1].iloc[3])
-            yr_growth = (float(mean) / prev_mean) - 1
-            growth_rates.append(yr_growth)
-            grow_str = f"YoY={yr_growth:.1%}"
-        else:
-            grow_str = ""
-        beats_ind = " > industry" if float(mean) > float(ind) else " < industry"
-        print(f"  {y}: consensus={float(mean):.2f}, range=[{lo}-{hi}], "
-              f"n={int(n):>2d}, disp={disp:.1%}, {grow_str}{beats_ind}")
-
+    for i in range(1, len(fc)):
+        prev = float(fc.iloc[i-1].iloc[3])
+        curr = float(fc.iloc[i].iloc[3])
+        if prev > 0: growth_rates.append(curr / prev - 1)
     if len(growth_rates) >= 2:
         g1, g2 = growth_rates[-1], growth_rates[-2]
-        if g1 > g2:
-            print(f"  >> Growth ACCELERATING: {g2:.1%} -> {g1:.1%}")
-        elif g1 < g2:
-            print(f"  >> Growth DECELERATING: {g2:.1%} -> {g1:.1%}")
-        else:
-            print(f"  >> Growth STABLE: {g1:.1%}")
-
-    # 2. Financial history
-    print("\n  [2] Recent Financial Performance (THS)")
-    print("  " + "-" * 52)
-    if fin is not None and not fin.empty:
-        fin_cols = list(fin.columns)
-        date_col = fin_cols[0]
-        eps_col = next((c for c in fin_cols if "每股收益" in c), fin_cols[7])
-        rev_col = next((c for c in fin_cols if "营业总收入" in c), fin_cols[5])
-        margin_col = next((c for c in fin_cols if "毛利率" in c), None)
-        roe_col = next((c for c in fin_cols if "净资产收益率" in c and "摊薄" not in c), None)
-        growth_col = next((c for c in fin_cols if "同比增长" in c and "净利润" in c and "扣非" not in c), None)
-
-        # Show last 6 annual + most recent quarter
-        annual = fin[~fin[date_col].astype(str).str.contains("03-31|06-30|09-30", na=False)]
-        recent_annual = annual.head(4)
-        tables = []
-        for _, r in recent_annual.iterrows():
-            d = str(r[date_col])[:10]
-            eps = r[eps_col]
-            rev = r[rev_col] if pd.notna(r[rev_col]) else "N/A"
-            margin = r[margin_col] if margin_col and pd.notna(r[margin_col]) else "N/A"
-            roe = r[roe_col] if roe_col and pd.notna(r[roe_col]) else "N/A"
-            grow = r[growth_col] if growth_col and pd.notna(r[growth_col]) else "N/A"
-            tables.append((d, eps, rev, margin, roe, grow))
-
-        if tables:
-            print(f"  {'Period':<14s} {'EPS':>8s} {'Revenue':>14s} {'Margin':>8s} {'ROE':>8s} {'YoY Profit':>12s}")
-            for d, eps, rev, margin, roe, grow in tables:
-                print(f"  {d:<14s} {str(eps):>8s} {str(rev):>14s} {str(margin):>8s} {str(roe):>8s} {str(grow):>12s}")
+        trend = "ACCEL" if g1 > g2 + 0.03 else ("DECEL" if g1 < g2 - 0.03 else "STABLE")
     else:
-        print("  No financial data available.")
+        trend = "N/A"
 
-    # 3. PEG Analysis
-    print("\n  [3] PEG Valuation Analysis")
-    print("  " + "-" * 52)
+    # Financials
+    time.sleep(1.5)
+    try:
+        fin = ak.stock_financial_abstract_ths(symbol=code)
+        dc=fin.columns[0]; rgc=fin.columns[6]; mgc=fin.columns[12]; pgc=fin.columns[2]
+        annual=fin[~fin[dc].astype(str).str.contains("03-31|06-30|09-30",na=False)]
+        na=len(annual)
+        rev_g, margin = None, None
+        for idx in range(na-1, -1, -1):
+            r=annual.iloc[idx]
+            if rev_g is None: rev_g=parse_pct(str(r[rgc]))
+            if margin is None: margin=parse_pct(str(r[mgc]))
+            if rev_g is not None and margin is not None: break
+        rev_g=rev_g or 0.0; margin=margin or 0.0
+        profit_q=min(1.0, max(0.0, margin*10))
 
-    if not elec_pe.empty:
-        pe_col = "pe" if "pe" in elec_pe.columns else [c for c in elec_pe.columns if "pe" in c.lower()][0]
-        pe_vals = pd.to_numeric(elec_pe[pe_col], errors="coerce").dropna()
-        pe_now = float(pe_vals.iloc[-1])
-        pe_med = float(pe_vals.median())
-        pe_p25 = float(pe_vals.quantile(0.25))
-        pe_p75 = float(pe_vals.quantile(0.75))
-        pe_min = float(pe_vals.min())
-        pe_max = float(pe_vals.max())
+        # Latest quarters
+        quarters=[]
+        for idx in range(max(0,len(fin)-3), len(fin)):
+            r=fin.iloc[idx]
+            d=str(r[dc])[:10]
+            quarters.append({
+                "date":d,
+                "rev_g":parse_pct(str(r[rgc])) or 0,
+                "profit_g":parse_pct(str(r[pgc])) or 0,
+                "margin":parse_pct(str(r[mgc])) or 0,
+            })
+    except Exception:
+        rev_g=margin=profit_q=0.0; quarters=[]
 
-        print(f"  Electronics Sector PE:")
-        print(f"    Current: {pe_now:.1f}  |  Median: {pe_med:.1f}")
-        print(f"    Range:   [{pe_min:.1f}, {pe_max:.1f}]")
-        print(f"    IQR:     [{pe_p25:.1f}, {pe_p75:.1f}]")
-        pe_position = (pe_now - pe_min) / (pe_max - pe_min) * 100 if pe_max > pe_min else 50
-        print(f"    Position: {pe_position:.0f}th percentile (lower = cheaper)")
+    # Industry info
+    industry = "半导体" if code.startswith("688") else "电子"
+    try:
+        ts = __import__('tushare').pro_api()
+        df = store.read_df("ai_stock_universe") if store.table_exists("ai_stock_universe") else pd.DataFrame()
+    except:
+        df = pd.DataFrame()
+    if not df.empty:
+        row = df[df["ts_code"].str.contains(code)]
+        if not row.empty: industry = row["industry"].iloc[0]
 
-        # PEG for each forecast year
-        print()
-        latest = stock_fc.iloc[-1]
-        prior = stock_fc.iloc[-2]
-        eps_next = float(latest.iloc[3])
-        eps_curr = float(prior.iloc[3])
-        growth = (eps_next / eps_curr) - 1
-        peg = pe_now / (growth * 100) if growth > 0 else 999
+    # PE / PEG
+    pe_now, pe_med = get_sector_pe(industry, code)
+    peg_val = pe_now / (eps_growth * 100) if eps_growth > 0 else 999
 
-        print(f"  PEG Calculation:")
-        print(f"    Consensus EPS (next year): {eps_next}")
-        print(f"    Consensus EPS (current):   {eps_curr}")
-        print(f"    Implied Growth Rate:       {growth:.1%}")
-        print(f"    PEG = {pe_now:.1f} / {growth * 100:.1f} = {peg:.2f}")
+    # PRG
+    prg_raw = (rev_g - 0.15) * 3
+    prg_sig = max(-1.0, min(1.0, prg_raw))
+    style = "PRG主导" if profit_q < 0.5 else ("混合" if profit_q < 0.8 else "PEG主导")
 
-        print()
-        if peg < 0.8:
-            print(f"    >>> STRONG BUY: PEG={peg:.2f} < 0.8")
-            print(f"        Market is significantly underpricing growth.")
-            print(f"        Expected gap is POSITIVE and WIDE.")
-        elif peg < 1.2:
-            print(f"    >>> BUY: PEG={peg:.2f} in 0.8~1.2")
-            print(f"        Growth reasonably priced with some margin of safety.")
-        elif peg < 2.0:
-            print(f"    >>> HOLD: PEG={peg:.2f} in 1.2~2.0")
-            print(f"        Growth fully priced — need acceleration for upside.")
+    # PEG trap
+    trap_type = _detect_peg_trap("sw_electronics", peg_val, eps_growth, 0.5, eps_disp).trap_type.value
+
+    # Dispersion signal
+    disp_signals = compute_dispersion_signals(lookback_snapshots=4)
+    disp_quad = "N/A"
+    disp_dcons = 0.0
+    for s in disp_signals:
+        if code in s.ts_code:
+            disp_quad = s.quadrant.value
+            disp_dcons = s.delta_consensus
+            break
+
+    return {
+        "code": code, "eps_next": eps_next, "eps_curr": eps_curr,
+        "eps_growth": eps_growth, "n_analysts": n_analysts,
+        "eps_disp": eps_disp, "trend": trend,
+        "rev_g": rev_g, "margin": margin, "profit_q": profit_q,
+        "pe_now": pe_now, "pe_med": pe_med, "peg": peg_val,
+        "prg_sig": prg_sig, "style": style,
+        "trap": trap_type, "disp_quad": disp_quad, "disp_dcons": disp_dcons,
+        "quarters": quarters, "industry": industry,
+    }
+
+# ── Display ────────────────────────────────────────────────────────
+
+HEADER_FMT = "{:<12s} {:>6s} {:>7s} {:>7s} {:>7s} {:>5s} {:>8s} {:>7s} {:>8s} {:>8s} {:>12s}"
+ROW_FMT = "{:<12s} {:>5.1f} {:>6.1%} {:>6.1%} {:>6.1%} {:>4.2f} {:>6.1f} {:>+6.2f} {:>+7.3f} {:>8s} {:>12s}"
+
+def print_header():
+    print("\n" + HEADER_FMT.format(
+        "Stock", "PEG", "G%", "RevG%", "Margin", "Q", "PE", "PRG", "PEGsig", "Style", "Disp/Q"
+    ))
+    print("-" * 88)
+
+def print_row(d):
+    print(ROW_FMT.format(
+        d["code"], d["peg"], d["eps_growth"], d["rev_g"], d["margin"],
+        d["profit_q"], d["pe_now"], d["prg_sig"], 0.0, d["style"],
+        f"{d['disp_quad']}/{d['eps_disp']:.0%}"
+    ))
+
+def print_detail(d, name_lookup):
+    label = name_lookup.get(d["code"], d["code"])
+    print(f"\n{'='*62}")
+    print(f"  {label} ({d['code']}) — {d['industry']}")
+    print(f"{'='*62}")
+    print(f"  PEG={d['peg']:.2f} | Growth={d['eps_growth']:.1%} | "
+          f"Rev.G={d['rev_g']:.1%} | Margin={d['margin']:.1%} | Q={d['profit_q']:.2f}")
+    print(f"  PE={d['pe_now']:.1f}(中位{d['pe_med']:.1f}) | PRG={d['prg_sig']:+.2f} | "
+          f"Style={d['style']} | Analysts={d['n_analysts']} | Disp={d['eps_disp']:.0%}")
+    print(f"  Disp.Quadrant={d['disp_quad']} | dCons={d['disp_dcons']:.1%} | "
+          f"Trap={d['trap']} | Growth={d['trend']}")
+    if d["quarters"]:
+        print(f"  Recent quarters:")
+        for q in d["quarters"]:
+            print(f"    {q['date']}: Rev.G={q['rev_g']:.1%} "
+                  f"Profit.G={q['profit_g']:.1%} Margin={q['margin']:.1%}")
+
+# ── Main ───────────────────────────────────────────────────────────
+
+def main():
+    codes = sys.argv[1:] if len(sys.argv) > 1 else []
+    if not codes:
+        print("Usage: uv run python scripts/analyze_stock.py <code1> [code2] ...")
+        print("Example: uv run python scripts/analyze_stock.py 002463 300502")
+        return
+
+    # Name lookup
+    name_lookup = {}
+    try:
+        fc = store.read_df("analyst_forecast")
+        for _, r in fc[["ts_code","name"]].drop_duplicates().iterrows():
+            name_lookup[r["ts_code"].split(".")[0]] = r["name"]
+    except: pass
+
+    results = []
+    for code in codes:
+        code = code.strip().replace(".SH","").replace(".SZ","").replace(".sh","").replace(".sz","")
+        print(f"\n... Analyzing {code} ...", end=" ", flush=True)
+        r = analyze(code)
+        if r:
+            results.append(r)
+            name = name_lookup.get(code, code)
+            print(f"OK ({name})")
         else:
-            print(f"    >>> CAUTION: PEG={peg:.2f} > 2.0")
-            print(f"        Market has already priced in aggressive growth expectations.")
+            print("NO DATA")
 
-        # Historical PEG context
-        for pct, label in [(25, "bear case"), (50, "median"), (75, "bull case")]:
-            pe_scenario = float(pe_vals.quantile(pct / 100))
-            peg_scenario = pe_scenario / (growth * 100) if growth > 0 else 999
-            print(f"    {label:>12s} (PE={pe_scenario:.1f}): PEG={peg_scenario:.2f}")
+    if not results:
+        print("\nNo valid data for any stock.")
+        return
 
-    # 4. Consensus Quality
-    print("\n  [4] Consensus Quality & Analyst Behavior")
-    print("  " + "-" * 52)
+    # Summary table
+    print("\n" + "=" * 88)
+    print("  COMPARISON TABLE")
+    print("=" * 88)
+    print_header()
+    for d in sorted(results, key=lambda x: x["peg"]):
+        print_row(d)
 
-    for _, r in stock_fc.iterrows():
-        y = r.iloc[0]
-        n = int(r.iloc[1])
-        lo, mean, hi = float(r.iloc[2]), float(r.iloc[3]), float(r.iloc[4])
-        ind = float(r.iloc[5])
-        disp = (hi - lo) / mean if mean > 0 else 0
-
-        # Premium to industry
-        premium = (mean - ind) / ind if ind > 0 else 0
-
-        print(f"  {y}: {n} analysts covering, dispersion={disp:.1%}")
-        print(f"       Consensus EPS={mean}, Industry Avg={ind}, Premium={premium:.1%}")
-
-        if disp < 0.20:
-            print(f"       >> TIGHT consensus — high conviction among analysts")
-        elif disp < 0.50:
-            print(f"       >> MODERATE dispersion — some debate but direction clear")
-        else:
-            print(f"       >> WIDE dispersion — significant disagreement, higher risk")
-
-    # 5. Snapshots status
-    print("\n  [5] Revision Sequence Status")
-    print("  " + "-" * 52)
-    sn = store.read_df("forecast_snapshots")
-    if not sn.empty:
-        stock_sn = sn[sn["symbol"] == code]
-        n_snaps = len(stock_sn)
-        print(f"  Snapshots accumulated: {n_snaps}")
-        if n_snaps >= 4:
-            print(f"  >> READY: Delta-PEG computation available")
-        elif n_snaps >= 2:
-            remaining = 4 - n_snaps
-            print(f"  >> {remaining} more weeks until Delta-PEG activates")
-        else:
-            print(f"  >> First snapshot — baseline established")
-            print(f"  >> 3 more weekly snapshots needed for revision tracking")
-    else:
-        print(f"  No snapshots yet — run collect_snapshots.py")
-
-    # 6. Summary
-    print()
-    print("=" * 62)
-    print("  EXPECTATION GAP SUMMARY")
-    print("=" * 62)
-
-    eps_last_actual = "N/A"
-    if fin is not None and not fin.empty:
-        eps_last_actual = str(fin.iloc[0][eps_col]) if eps_col in fin.columns else "N/A"
-
-    print(f"""
-  Stock:          {name} ({code}.SZ)
-  Sector:         Electronics (PCB)
-  Consensus EPS:  {eps_next} (forward year)
-  Implied Growth: {growth:.1%}
-  Sector PE:      {pe_now:.1f}
-  PEG:            {peg:.2f}
-  Analyst Count:  {int(stock_fc.iloc[-1].iloc[1])}
-  Dispersion:     {(float(stock_fc.iloc[-1].iloc[4]) - float(stock_fc.iloc[-1].iloc[2])) / float(stock_fc.iloc[-1].iloc[3]):.1%}
-  Industry Prem:  {(float(stock_fc.iloc[-1].iloc[3]) - float(stock_fc.iloc[-1].iloc[5])) / float(stock_fc.iloc[-1].iloc[5]):.1%}
-  Last EPS:       {eps_last_actual}
-  Revision Data:  {n_snaps} snapshots (need 4+)
-
-  JUDGMENT:
-    PEG = {peg:.2f} is {"LOW — market may be underpricing" if peg < 0.8 else "REASONABLE" if peg < 1.5 else "HIGH — growth already priced in"}
-    the {growth:.1%} consensus growth rate.
-
-    {"Growth ACCELERATING — EPS momentum is building." if len(growth_rates) >= 2 and growth_rates[-1] > growth_rates[-2] else "Growth stable." if len(growth_rates) >= 2 else ""}
-
-    {"Analyst consensus is TIGHT ({:.0%} dispersion) — high conviction signal.".format(disp) if disp < 0.20 else "Moderate analyst dispersion ({:.0%}) — some uncertainty remains.".format(disp)}
-""")
-
-    # ── PEG Trap Analysis ──
-    trap = _detect_peg_trap("sw_electronics", peg, growth, signal=0.5, dispersion=disp)
-    if trap.trap_type != PegTrapType.NONE:
-        print(f"""  [!] PEG TRAP: {trap.headline}
-
-    SCENARIO A: {trap.scenario_a}
-
-    SCENARIO B: {trap.scenario_b}
-
-    EVIDENCE NEEDED (top 4 checks):
-""")
-        for j, check in enumerate(trap.evidence_checklist[:4]):
-            print(f"      [{j+1}] {check}")
-        print()
-
-    print(f"""  BLIND SPOTS (model cannot see):
-    - PCB is a cyclical manufacturing business — is AI demand structural enough to override the PCB cycle?
-    - Customer concentration: key clients include Huawei, ZTE, and server OEMs
-    - Raw material cost (copper, CCL) can compress margins unexpectedly
-    - Geopolitical risk: PCB exports subject to trade policy changes
-
-  QUESTIONS for human judgment:
-    - Can AI server PCB demand sustain 40%+ growth for 3 consecutive years?
-    - Is the current sector PE of {pe_now:.1f} (vs median {pe_med:.1f}) cheap because the market is right about a PCB cycle downturn, or cheap because the market is underestimating AI structural demand?
-    - What do supply chain checks say about 沪电's order book for 2H 2026?
-""")
-
-    print("=" * 62)
-
+    # Detail per stock
+    for d in results:
+        print_detail(d, name_lookup)
 
 if __name__ == "__main__":
     main()

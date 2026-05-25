@@ -260,7 +260,11 @@ uv run python scripts/collect_snapshots.py
 # 2. 生成分析报告（PEG排名 + 标注 + 盲点）
 uv run python scripts/generate_report.py
 
-# 3. （可选）跑回测验证
+# 3. 个股/多股深度分析
+uv run python scripts/analyze_stock.py 002463                    # 单只
+uv run python scripts/analyze_stock.py 002463 300502 688041      # 多股对比
+
+# 4. （可选）跑回测验证
 uv run python scripts/run_pipeline_v3.py
 ```
 
@@ -318,6 +322,20 @@ PEG = Sector PE / Consensus Growth Rate
   peg_signal += -0.30 × ΔPEG_z + 0.30 × ΔGrowth_revision_z
                 ↑ PEG缩小加分      ↑ 增速上修加分
 ```
+
+### 混合 PEG（PRG 自动接管）— `factors/peg_factor.py`
+
+```
+Q = min(1.0, 净利率 × 10)    ← 利润质量权重（全自动，无主观判断）
+
+Hybrid_Signal = Q × PEG_Signal + (1-Q) × PRG_Signal
+
+Q = 1.0（净利率>10%）：纯 PEG，成熟公司
+Q = 0.5（净利率=5%）： PEG和PRG各半
+Q = 0.0（无利润）：   纯 PRG，营收增速是唯一信号
+```
+
+PRG 信号基于营收增速：`PRG = clamp((Rev.G - 15%) × 3, -1, 1)`。当公司利润率薄时自动调节——营收爆发型的早期公司不会被 PEG 误判。
 
 ### 当前 PEG 排名（2026-05-13）
 
@@ -561,12 +579,14 @@ TradingGod/
 | 宏观数据 | OK (6 组) |
 | Tushare SW PE 数据 | OK (16K rows) |
 | THS 分析师预测 | OK (107 stocks) |
-| 预测快照系统 | OK (2 snapshots, 2 more to activate) |
+| 预测快照系统 | OK (4 snapshots, activated) |
 | PEG 因子（静态） | OK |
+| 混合 PEG（PRG自动接管）| OK |
 | PEG 陷阱检测 | OK (LOW/HIGH PEG trap) |
-| 分歧因子（四象限） | OK (pending 2 more snapshots) |
+| 分歧因子（四象限） | OK (activated, 11 stocks with 4+ weeks) |
 | 元数据标注 | OK |
 | 个股深度分析 | OK (`analyze_stock.py`) |
+| 多股对比分析 | OK (`analyze_stock.py` multi) |
 | 分析报告生成 | OK |
 | 回测引擎（无前视偏差） | OK |
-| 修正序列（ΔPEG + 分歧） | [2 more weeks until activation] |
+| 修正序列（ΔPEG + 分歧） | OK |
