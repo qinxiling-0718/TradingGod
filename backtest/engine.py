@@ -317,7 +317,16 @@ class WeeklyBacktestEngine:
         s["date"] = pd.to_datetime(s["date"])
         p["date"] = pd.to_datetime(p["date"])
 
-        merged = s.merge(p[["date", "symbol", "close"]], on=["date", "symbol"], how="inner")
+        # Normalize close column name and avoid merge duplicates
+        close_col = "close" if "close" in p.columns else ("收盘" if "收盘" in p.columns else None)
+        if close_col is None:
+            return
+        # Drop close from signal_df to avoid _x/_y suffix on merge
+        if "close" in s.columns:
+            s = s.drop(columns=["close"])
+        p_cols = ["date", "symbol", close_col]
+        p_sub = p[p_cols].rename(columns={close_col: "close"}).drop_duplicates(["date", "symbol"])
+        merged = s.merge(p_sub, on=["date", "symbol"], how="inner")
         merged = merged.sort_values(["symbol", "date"])
         merged["fwd_return"] = merged.groupby("symbol")["close"].transform(
             lambda x: x.shift(-1) / x - 1
