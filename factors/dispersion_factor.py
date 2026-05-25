@@ -32,6 +32,15 @@ DB_PATH = "data/trading_god.duckdb"
 store = DuckDBStore(DB_PATH)
 
 
+class CoveragePhase(str, Enum):
+    """Analyst coverage lifecycle phase."""
+    PRE_COVERAGE = "pre_coverage"         # 0 analysts — pure narrative, no data
+    FIRST_TOUCH = "first_touch"           # 1-2 analysts — brave first movers
+    EXPANDING = "expanding"               # 3-9 analysts — coverage accelerating
+    ESTABLISHED = "established"           # 10+ analysts — mature coverage
+    DECLINING = "declining"               # Coverage shrinking — analysts leaving
+
+
 class DispersionQuadrant(str, Enum):
     CONSENSUS_FORMING = "consensus_forming"         # Q1: narrowing + rising
     DEBATE_INTENSIFYING = "debate_intensifying"      # Q2: widening + rising
@@ -58,11 +67,13 @@ class DispersionSignal:
     delta_consensus: float           # % change in consensus mean
     delta_dispersion: float          # change in dispersion ratio
     delta_analysts: int              # change in analyst count
+    coverage_velocity: float = 0.0   # analysts added per snapshot (加速度)
+    coverage_phase: CoveragePhase = CoveragePhase.PRE_COVERAGE
 
     # Signal
-    quadrant: DispersionQuadrant
-    signal_score: float              # -1.0 to +1.0
-    signal_confidence: float         # 0.0 to 1.0
+    quadrant: DispersionQuadrant = DispersionQuadrant.INSUFFICIENT_DATA
+    signal_score: float = 0.0
+    signal_confidence: float = 0.0
 
     # Interpretation
     narrative: str = ""
@@ -84,17 +95,21 @@ def compute_dispersion_signals(lookback_snapshots: int = 4) -> list[DispersionSi
     if snaps.empty:
         return []
 
-    # Identify columns
+    # THS columns are always at fixed positions in the snapshot table:
+    #   [0] = 年度 (year)
+    #   [1] = 预测人数 (analyst count)
+    #   [2] = 最小值 (min EPS)
+    #   [3] = 均值 (consensus mean EPS)
+    #   [4] = 最大值 (max EPS)
+    #   [5] = 行业平均数 (industry avg EPS)
+    #   [6+] = metadata (snapshot_date, ts_code, symbol, name, ...)
     cols = list(snaps.columns)
-    # forecast_snapshots has: snapshot_date, ts_code, symbol, name, sector_label,
-    # plus the original THS columns: 年度, 预测人数, 最小值, 均值, 最大值, 行业平均数
-    # The THS columns are at fixed positions: col 0=年度, 1=预测人数, 2=最小值, 3=均值, 4=最大值, 5=行业平均
-    ths_cols = [c for c in cols if c not in ("snapshot_date", "ts_code", "symbol", "name", "sector_label")]
-    col_mean = [c for c in ths_cols if "均" in c][0] if any("均" in c for c in ths_cols) else ths_cols[0]
-    col_min = [c for c in ths_cols if "小" in c][0] if any("小" in c for c in ths_cols) else ths_cols[0]
-    col_max = [c for c in ths_cols if "大" in c][0] if any("大" in c for c in ths_cols) else ths_cols[0]
-    col_n = [c for c in ths_cols if "人" in c or "数" in c][0] if any("人" in c for c in ths_cols) else ths_cols[0]
-    col_year = [c for c in ths_cols if "年" in c][0] if any("年" in c for c in ths_cols) else ths_cols[0]
+    col_year = cols[0]
+    col_n = cols[1]
+    col_min = cols[2]
+    col_mean = cols[3]
+    col_max = cols[4]
+    col_ind = cols[5]
 
     # For each (stock, forecast_year), track consensus over snapshots
     signals = []
@@ -154,6 +169,24 @@ def compute_dispersion_signals(lookback_snapshots: int = 4) -> list[DispersionSi
         delta_disp = disps_arr[-1] - disps_arr[0]
         delta_n = int(ns_arr[-1] - ns_arr[0])
 
+        # Coverage velocity: avg new analysts per snapshot
+        coverage_velocity = delta_n / max(lookback_snapshots - 1, 1)
+
+        # Coverage phase classification
+        current_n = int(ns_arr[-1])
+        if current_n == 0:
+            phase = CoveragePhase.PRE_COVERAGE
+        elif current_n <= 2:
+            phase = CoveragePhase.FIRST_TOUCH
+        elif delta_n > 2:
+            phase = CoveragePhase.EXPANDING      # Rapidly gaining coverage
+        elif current_n >= 10:
+            phase = CoveragePhase.ESTABLISHED
+        elif delta_n < -2:
+            phase = CoveragePhase.DECLINING
+        else:
+            phase = CoveragePhase.EXPANDING if current_n < 10 else CoveragePhase.ESTABLISHED
+
         # ── Quadrant classification ──
         mean_rising = delta_mean > 0.01     # 1%+ change = rising
         mean_falling = delta_mean < -0.01   # -1%+ change = falling
@@ -207,6 +240,25 @@ def compute_dispersion_signals(lookback_snapshots: int = 4) -> list[DispersionSi
         else:
             continue  # No clear quadrant — insufficient signal
 
+        # Coverage acceleration bonus
+        # When analysts are RAPIDLY joining + consensus is rising = strong positive
+        if phase == CoveragePhase.EXPANDING and mean_rising:
+            signal_score += 0.15 * min(1.0, coverage_velocity / 3.0)
+            signal_confidence += 0.1
+            narrative += (
+                f" Coverage ACCELERATING (+{coverage_velocity:.1f}/snap). "
+                f"Phase: {phase.value}. More analysts entering = attention compounding."
+            )
+        elif phase == CoveragePhase.FIRST_TOUCH and mean_rising:
+            narrative += (
+                f" EARLY STAGE: only {current_n} analysts. "
+                f"Extreme information asymmetry — biggest alpha potential, highest risk."
+            )
+
+        # Cap scores
+        signal_score = max(-1.0, min(1.0, signal_score))
+        signal_confidence = max(0.0, min(1.0, signal_confidence))
+
         signals.append(DispersionSignal(
             ts_code=code,
             name=name,
@@ -218,6 +270,8 @@ def compute_dispersion_signals(lookback_snapshots: int = 4) -> list[DispersionSi
             delta_consensus=delta_mean,
             delta_dispersion=delta_disp,
             delta_analysts=delta_n,
+            coverage_velocity=coverage_velocity,
+            coverage_phase=phase,
             quadrant=quadrant,
             signal_score=signal_score,
             signal_confidence=signal_confidence,
@@ -329,11 +383,11 @@ def print_dispersion_report(signals: list[DispersionSignal]):
     if q1:
         print(f"\n  [Q1] CONSENSUS FORMING ({len(q1)} stocks) — STRONGEST BUY")
         print(f"  " + "-" * 58)
-        print(f"  {'Stock':<12s} {'Signal':>7s} {'dCons':>8s} {'dDisp':>8s} {'dAnalyst':>9s} {'Disp Now':>9s}")
+        print(f"  {'Stock':<12s} {'Signal':>7s} {'dCons':>8s} {'dDisp':>8s} {'dN':>5s} {'Phase':>14s}")
         for s in sorted(q1, key=lambda x: -x.signal_score):
             print(f"  {s.name:<12s} {s.signal_score:>+6.3f} {s.delta_consensus:>+7.1%} "
-                  f"{s.delta_dispersion:>+7.1%} {s.delta_analysts:>+8d} {s.current_dispersion:>8.1%}")
-            print(f"    -> {s.narrative[:100]}")
+                  f"{s.delta_dispersion:>+7.1%} {s.delta_analysts:>+4d} {s.coverage_phase.value:>14s}")
+            print(f"    -> {s.narrative[:110]}")
 
     # Q2: The watch zone (debate before consensus)
     if q2:

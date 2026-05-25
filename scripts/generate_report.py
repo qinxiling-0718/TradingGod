@@ -36,7 +36,11 @@ def main():
             "name": r["sector"],
             "peg": r["avg_peg"],
             "growth": r["avg_growth"],
-            "signal": r["signal_score"],
+            "signal": r.get("signal_score", r.get("peg_signal", 0)),
+            "revenue_growth": r.get("avg_revenue_growth", 0),
+            "profit_quality": r.get("avg_profit_quality", 0.5),
+            "peg_signal": r.get("peg_signal", 0),
+            "prg_signal": r.get("prg_signal", 0),
             "n_analysts": int(r["stock_count"]),
             "dispersion": r.get("avg_dispersion", 0),
             "dispersion_trend": "stable",
@@ -54,7 +58,10 @@ def main():
         print(f"{'─' * 65}")
 
         print(f"  PEG = {ann.peg:.1f}  |  Growth = {ann.consensus_growth:.1%}  |  "
-              f"Analysts = {ann.analyst_count}  |  Dispersion = {ann.dispersion:.1%}")
+              f"Rev.Growth = {ann.revenue_growth:.1%}  |  Profit Quality = {ann.profit_quality:.2f}")
+        print(f"  Hybrid Signal = {ann.signal_score:+.3f}  "
+              f"(PEG-only: {ann.peg_signal:+.3f}, PRG-only: {ann.prg_signal:+.3f})")
+        print(f"  Analysts/Stocks = {ann.analyst_count}  |  Dispersion = {ann.dispersion:.1%}")
 
         # Growth nature
         nature_label = {

@@ -61,6 +61,11 @@ class SectorAnnotation:
     consensus_growth: float
     signal_score: float
     signal_direction: str  # "positive" / "negative" / "neutral"
+    # Hybrid PEG
+    revenue_growth: float = 0.0
+    profit_quality: float = 0.5
+    peg_signal: float = 0.0
+    prg_signal: float = 0.0
 
     # What the model sees
     model_observations: list[str] = field(default_factory=list)
@@ -101,6 +106,10 @@ def annotate_sector(
     dispersion: float = 0.0,
     dispersion_trend: str = "stable",
     stocks: int = 0,
+    revenue_growth: float = 0.0,
+    profit_quality: float = 0.5,
+    peg_signal: float = 0.0,
+    prg_signal: float = 0.0,
 ) -> SectorAnnotation:
     """Generate a complete sector annotation from factor data.
 
@@ -117,6 +126,10 @@ def annotate_sector(
         consensus_growth=growth,
         signal_score=signal,
         signal_direction=direction,
+        revenue_growth=revenue_growth,
+        profit_quality=profit_quality,
+        peg_signal=peg_signal,
+        prg_signal=prg_signal,
         analyst_count=n_analysts,
         dispersion=dispersion,
         dispersion_trend=dispersion_trend,
@@ -456,6 +469,10 @@ def generate_analysis_report(
             dispersion=s.get("dispersion", 0),
             dispersion_trend=s.get("dispersion_trend", "stable"),
             stocks=s.get("stocks", 0),
+            revenue_growth=s.get("revenue_growth", 0),
+            profit_quality=s.get("profit_quality", 0.5),
+            peg_signal=s.get("peg_signal", 0),
+            prg_signal=s.get("prg_signal", 0),
         )
         annotations.append(ann)
 
