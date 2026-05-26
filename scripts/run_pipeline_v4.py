@@ -30,7 +30,7 @@ PRO = ts.pro_api()
 # ── Config ──────────────────────────────────────────────────────────
 
 TOP_N = 15           # Top N stocks to hold
-ALPHA = 0.35         # Base momentum weight
+ALPHA = 0.12         # Momentum weight (fundamentals lead, momentum assists)
 START = "20200101"
 CALL_DELAY = 1.0     # Tushare rate limit
 
@@ -112,14 +112,97 @@ def fetch_weekly_prices(universe: pd.DataFrame) -> pd.DataFrame:
     return combined
 
 
-# ── Step 3: Weekly Signals ─────────────────────────────────────────
+# ── Step 3: Certainty Dimensions ───────────────────────────────────
+
+def compute_certainty(universe: pd.DataFrame) -> dict:
+    """Three data-driven certainty dimensions per stock.
+
+    Certainty is NOT analyst count. It is data consistency:
+      1. Profit Realization: are profits actually delivering?
+      2. Growth Stability: is revenue growth predictable?
+      3. Moat: margin level × stability → sustainable advantage?
+    """
+    print("[3/5] Computing certainty dimensions...")
+    certainty = {}
+    for _, row in universe.iterrows():
+        sym = row["symbol"]
+        try:
+            import akshare as ak
+            fin = ak.stock_financial_abstract_ths(symbol=sym)
+            if fin is None or fin.empty:
+                certainty[sym] = 0.5; continue
+
+            dc=fin.columns[0]; rgc=fin.columns[6]; mgc=fin.columns[12]; pgc=fin.columns[2]
+
+            # Get recent quarters (newest 8)
+            fin_sorted = fin.sort_values(dc, ascending=False) if fin[dc].dtype == 'O' else fin.sort_values(dc, ascending=False)
+            recent = fin_sorted.head(8)
+
+            margins = []; rev_growths = []; profit_growths = []
+            for _, r in recent.iterrows():
+                def pp(raw):
+                    if not raw or raw in ('False','None','nan',''): return None
+                    try: return float(str(raw).replace('%','').replace('+','').strip())/100.0
+                    except: return None
+                mg=pp(str(r[mgc])); rg=pp(str(r[rgc])); pg=pp(str(r[pgc]))
+                if mg is not None: margins.append(mg)
+                if rg is not None: rev_growths.append(rg)
+                if pg is not None: profit_growths.append(pg)
+
+            if len(margins)<3 or len(rev_growths)<3:
+                certainty[sym] = 0.5; continue
+
+            # 1. Profit Realization: trend of actual profit vs direction
+            profit_trend = np.mean(profit_growths[-3:]) if len(profit_growths)>=3 else 0
+            profit_real = 1.0 / (1.0 + np.exp(-profit_trend * 5))
+            # penalize large negative swings
+            profit_vol = np.std(profit_growths[-4:]) if len(profit_growths)>=4 else 1.0
+            profit_real *= max(0.0, 1.0 - profit_vol)
+
+            # 2. Growth Stability: rev growth predictability
+            if len(rev_growths)>=4:
+                rev_mean = np.mean(rev_growths[-4:])
+                rev_std = np.std(rev_growths[-4:])
+                growth_stab = 1.0 / (1.0 + rev_std / max(abs(rev_mean), 0.05))
+            else:
+                growth_stab = 0.5
+
+            # 3. Moat: margin level × margin stability
+            mg_mean = np.mean(margins[-4:]) if len(margins)>=4 else np.mean(margins)
+            mg_std = np.std(margins[-4:]) if len(margins)>=4 else 1.0
+            mg_level = min(1.0, max(0.0, mg_mean * 5))
+            mg_stability = 1.0 / (1.0 + mg_std / max(abs(mg_mean), 0.02))
+            moat = mg_level * mg_stability
+
+            # Composite certainty
+            cert = 0.40 * profit_real + 0.30 * growth_stab + 0.30 * moat
+            certainty[sym] = round(max(0.05, min(1.0, cert)), 3)
+
+        except Exception:
+            certainty[sym] = 0.5
+
+    # Print distribution
+    high = sum(1 for v in certainty.values() if v>0.7)
+    mid = sum(1 for v in certainty.values() if 0.3<=v<=0.7)
+    low = sum(1 for v in certainty.values() if v<0.3)
+    print(f"  Certainty: {high} high (>0.7), {mid} mid, {low} low (<0.3)")
+
+    # Show extremes
+    sorted_c = sorted(certainty.items(), key=lambda x:-x[1])
+    print(f"  Highest: {', '.join(f'{s}={v:.2f}' for s,v in sorted_c[:4])}")
+    print(f"  Lowest:  {', '.join(f'{s}={v:.2f}' for s,v in sorted_c[-4:])}")
+    return certainty
+
+
+# ── Step 4: Weekly Signals ─────────────────────────────────────────
 
 def compute_weekly_signals(
     universe: pd.DataFrame,
     prices: pd.DataFrame,
+    certainty: dict,
 ) -> pd.DataFrame:
-    """Generate time-varying signals: static factor + dynamic momentum."""
-    print("[3/4] Computing weekly signals...")
+    """Generate time-varying signals: static factor × certainty + quality-gated momentum."""
+    print("[4/5] Computing weekly signals...")
 
     prices = prices.copy()
     prices["date"] = pd.to_datetime(prices["date"])
@@ -154,6 +237,11 @@ def compute_weekly_signals(
             continue
         static_score = float(stock_info["hybrid_signal"].iloc[0])
 
+        # Data-driven certainty (profit realization + growth stability + moat)
+        cert = certainty.get(symbol, 0.5)
+        # Fundamental floor: static score gets at least 50% weight
+        fundamental_weight = max(cert, 0.5)
+
         # Quality-gated momentum: good companies get full boost, weak ones get reduced
         quality_gate = 1.0 / (1.0 + np.exp(-static_score * 3))  # sigmoid: 0→1
         effective_alpha = ALPHA * quality_gate
@@ -164,9 +252,11 @@ def compute_weekly_signals(
                 "symbol": symbol,
                 "close": close[i],
                 "static_score": static_score,
+                "certainty": cert,
+                "effective_static": static_score * fundamental_weight,
                 "dynamic_z": dynamic[i],
                 "quality_gate": quality_gate,
-                "signal_score": static_score + effective_alpha * dynamic[i],
+                "signal_score": static_score * fundamental_weight + effective_alpha * dynamic[i],
             })
 
     signals = pd.DataFrame(records)
@@ -174,10 +264,10 @@ def compute_weekly_signals(
     return signals
 
 
-# ── Step 4: Backtest ────────────────────────────────────────────────
+# ── Step 5: Backtest ────────────────────────────────────────────────
 
 def run_backtest(signals: pd.DataFrame, universe: pd.DataFrame):
-    print("[4/4] Running backtest...")
+    print("[5/5] Running backtest...")
 
     prices = signals[["date", "symbol", "close"]].copy()
 
@@ -212,14 +302,15 @@ def run_backtest(signals: pd.DataFrame, universe: pd.DataFrame):
     # Current top holdings
     latest_date = signals["date"].max()
     latest = signals[signals["date"] == latest_date].nlargest(10, "signal_score")
-    print(f"\n  Top 10 stocks ({latest_date.date()}):")
-    print(f"  {'':>4s} {'Stock':<12s} {'Total':>7s} {'Static':>7s} {'Dynamic':>7s} {'Gate':>5s}")
+    print(f"\n  Top 15 stocks ({latest_date.date()}):")
+    print(f"  {'':>4s} {'Stock':<12s} {'Total':>7s} {'Static':>7s} {'Eff.St':>7s} {'Dyn':>6s} {'Cert':>5s}")
     for i, (_, r) in enumerate(latest.iterrows()):
         name = universe[universe["symbol"] == r["symbol"]]
         stock_name = name["name"].iloc[0] if not name.empty else r["symbol"]
-        gate = r.get("quality_gate", r.get("dynamic_z", 0) * 0.35 / max(r["dynamic_z"] * 0.35, 0.01) if r["dynamic_z"] != 0 else 0.5)
-        print(f"  {i+1:>3d}. {stock_name:<12s} {r['signal_score']:>+6.3f} {r['static_score']:>+7.3f} "
-              f"{r['dynamic_z']:>+7.2f} {gate:>4.2f}")
+        cert = r.get("certainty", 0.5)
+        eff_st = r.get("effective_static", r["static_score"])
+        print(f"  {i+1:>3d}. {stock_name:<12s} {r['signal_score']:>+7.3f} {r['static_score']:>+7.3f} "
+              f"{eff_st:>+7.3f} {r['dynamic_z']:>+6.2f} {cert:>4.2f}")
 
     return result, report
 
@@ -233,7 +324,8 @@ def main():
 
     universe = build_universe()
     prices = fetch_weekly_prices(universe)
-    signals = compute_weekly_signals(universe, prices)
+    certainty = compute_certainty(universe)
+    signals = compute_weekly_signals(universe, prices, certainty)
     result, report = run_backtest(signals, universe)
 
     print("\nPipeline complete.")

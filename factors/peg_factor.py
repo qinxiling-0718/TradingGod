@@ -150,17 +150,31 @@ def compute_peg_factors(use_revisions: bool = True) -> pd.DataFrame:
         dispersion = (eps_max - eps_min) / eps if eps > 0 else 1.0
         quality = max(0, 1.0 - min(dispersion, 2.0))
 
-        # ── Revenue & Profit Quality (hybrid PEG) ──
+        # ── Actual Core Growth (扣非归母净利润) ──
         symbol = sf["symbol"].iloc[0]
+        actual_growth = _get_actual_core_growth(symbol)
+        # Fallback to consensus growth if actual unavailable
+        if actual_growth is None or actual_growth == 0:
+            actual_growth = growth
+
+        # ── Revenue & Profit Quality (hybrid PEG) ──
         fin = _get_financial_metrics(symbol)
         rev_growth = fin.get("revenue_growth")
         net_margin = fin.get("net_margin")
         profit_quality = _compute_profit_quality(net_margin)
 
+        # ── Surprise: actual vs consensus ──
+        surprise_ratio = actual_growth / growth if growth > 0 else 1.0
+        # Clamp to reasonable range
+        surprise_ratio = max(0.2, min(5.0, surprise_ratio))
+
+        # ── Real PEG using actual growth (not consensus) ──
+        real_peg = forward_pe / (actual_growth * 100) if actual_growth > 0 else float("inf")
+        if real_peg <= 0 or real_peg > 100:
+            real_peg = 100.0
+
         # PRG proxy: revenue growth alone (simplified PR-to-Growth)
-        # Higher revenue growth = higher PRG signal
-        prg_signal = (rev_growth if rev_growth else growth) - 0.15  # 15% baseline
-        # Normalize: 0% growth = -1 signal, 50%+ = +1 signal
+        prg_signal = (rev_growth if rev_growth else growth) - 0.15
         prg_signal = max(-1.0, min(1.0, prg_signal * 3))
 
         # ΔPEG from snapshots (if available)
@@ -171,9 +185,14 @@ def compute_peg_factors(use_revisions: bool = True) -> pd.DataFrame:
         results.append({
             "ts_code": code, "name": name, "sector": sector,
             "consensus_eps": eps, "consensus_growth": growth,
-            "forward_pe": forward_pe, "peg": peg,
+            "actual_growth": actual_growth,
+            "surprise_ratio": surprise_ratio,
+            "real_peg": real_peg,
+            "forward_pe": forward_pe, "peg": real_peg,
+            "consensus_peg": peg,  # keep old consensus PEG for reference
             "dispersion": dispersion, "quality": quality,
             "delta_peg": delta_peg, "growth_revision": growth_rev,
+            "n_analysts": int(latest.iloc[1]),
             "revenue_growth": rev_growth or 0.0,
             "net_margin": net_margin or 0.0,
             "profit_quality": profit_quality,
@@ -187,30 +206,73 @@ def compute_peg_factors(use_revisions: bool = True) -> pd.DataFrame:
     # Filter out infinite PEG
     df = df[df["peg"] < 50].copy()
 
-    # Cross-sectional z-scores
-    for col in ["peg", "consensus_growth", "quality"]:
-        mu, sigma = df[col].mean(), df[col].std()
-        df[col + "_z"] = (df[col] - mu) / sigma if sigma > 0 else 0.0
+    # ── Real PEG scoring (based on actual growth, not consensus) ──
+    df["peg_score"] = 0.0
+    df.loc[df["real_peg"] < 0.3,  "peg_score"] = +1.0
+    df.loc[(df["real_peg"] >= 0.3) & (df["real_peg"] < 0.5),  "peg_score"] = +0.8
+    df.loc[(df["real_peg"] >= 0.5) & (df["real_peg"] < 0.8),  "peg_score"] = +0.5
+    df.loc[(df["real_peg"] >= 0.8) & (df["real_peg"] < 1.2),  "peg_score"] = +0.2
+    df.loc[(df["real_peg"] >= 1.2) & (df["real_peg"] < 2.0),  "peg_score"] = 0.0
+    df.loc[(df["real_peg"] >= 2.0) & (df["real_peg"] < 3.0),  "peg_score"] = -0.3
+    df.loc[df["real_peg"] >= 3.0, "peg_score"] = -0.6
 
-    # PEG signal: low PEG = good, high growth = good, high quality = good
+    # Growth score: LOGARITHMIC scale, capped at 300%
+    # 50%→+0.26, 100%→+0.36, 200%→+0.51, 300%→+0.60
+    # Diminishing returns: each extra % of growth matters less
+    capped_growth = df["actual_growth"].clip(upper=3.0)
+    df["growth_score"] = np.log10(1 + capped_growth * 3) / np.log10(10) * 0.6
+    # Negative growth: linear penalty
+    df.loc[df["actual_growth"] < 0.0, "growth_score"] = df["actual_growth"] * 2
+    df["growth_score"] = df["growth_score"].clip(-1.0, 1.0)
+
+    # Deadweight penalty for deep losses
+    df.loc[df["actual_growth"] < -0.10, "growth_score"] -= 0.3
+    df.loc[df["actual_growth"] <= 0.0, "peg_score"] -= 0.3
+
+    # Act.G < 0 → force pure PEG (PRG cannot rescue profit collapse)
+    df.loc[df["actual_growth"] < 0.0, "profit_quality"] = 1.0
+
+    # Coverage minimum: < 3 analysts → excluded
+    df = df[df["n_analysts"] >= 3].copy()
+
+    # Surprise bonus: actual >> consensus → consensus is lagging → alpha
+    df["surprise_score"] = 0.0
+    df.loc[df["surprise_ratio"] > 3.0, "surprise_score"] = +0.3
+    df.loc[(df["surprise_ratio"] > 2.0) & (df["surprise_ratio"] <= 3.0), "surprise_score"] = +0.2
+    df.loc[(df["surprise_ratio"] > 1.5) & (df["surprise_ratio"] <= 2.0), "surprise_score"] = +0.1
+    df.loc[df["surprise_ratio"] < 0.5, "surprise_score"] = -0.2
+
+    # Quality score: low dispersion → higher confidence
+    df["quality_score"] = 0.0
+    df.loc[df["quality"] > 0.8,  "quality_score"] = +0.2
+    df.loc[df["quality"] > 0.5,  "quality_score"] = +0.1
+    df.loc[df["quality"] <= 0.3, "quality_score"] = -0.2
+
+    # PEG signal: real PEG + actual growth + quality + surprise bonus
     df["peg_signal"] = (
-        -0.40 * df["peg_z"] +              # Lower PEG → higher signal
-         0.40 * df["consensus_growth_z"] +  # Higher growth → higher signal
-         0.20 * df["quality_z"]             # Lower dispersion → higher signal
+        0.35 * df["peg_score"] +
+        0.35 * df["growth_score"] +
+        0.15 * df["quality_score"] +
+        0.15 * df["surprise_score"]
     )
 
-    # PRG z-score (revenue growth cross-sectional)
-    mu_rg, sigma_rg = df["revenue_growth"].mean(), df["revenue_growth"].std()
-    df["prg_z"] = (df["revenue_growth"] - mu_rg) / sigma_rg if sigma_rg > 0 else 0.0
-    df["prg_signal"] = 0.7 * df["prg_z"].clip(-3, 3)
+    # PRG score: absolute revenue growth thresholds
+    df["prg_score"] = 0.0
+    df.loc[df["revenue_growth"] > 0.50, "prg_score"] = +0.5
+    df.loc[(df["revenue_growth"] > 0.30) & (df["revenue_growth"] <= 0.50), "prg_score"] = +0.3
+    df.loc[(df["revenue_growth"] > 0.15) & (df["revenue_growth"] <= 0.30), "prg_score"] = +0.1
+    df.loc[(df["revenue_growth"] > 0.0)  & (df["revenue_growth"] <= 0.15), "prg_score"] = -0.1
+    df.loc[df["revenue_growth"] <= 0.0, "prg_score"] = -0.3
+
+    # Act.G < 0 → force pure PEG (PRG cannot rescue profit collapse)
+    df["effective_pq"] = df["profit_quality"].copy()
+    df.loc[df["actual_growth"] < 0.0, "effective_pq"] = 1.0
 
     # HYBRID signal: profit-quality blended PEG + PRG
-    # quality → 1.0: almost pure PEG (mature companies)
-    # quality → 0.0: almost pure PRG (early stage companies)
-    df["quality_weight"] = df["profit_quality"]  # for display
+    df["quality_weight"] = df["profit_quality"]
     df["hybrid_signal"] = (
-        df["profit_quality"] * df["peg_signal"] +
-        (1 - df["profit_quality"]) * df["prg_signal"]
+        df["effective_pq"] * df["peg_signal"] +
+        (1 - df["effective_pq"]) * df["prg_score"]
     )
 
     # Add revision bonus if available
@@ -317,6 +379,33 @@ def _parse_pct(raw: str) -> float | None:
         clean = raw.replace("%", "").replace("+", "").strip()
         return float(clean) / 100.0
     except ValueError:
+        return None
+
+
+def _get_actual_core_growth(symbol: str) -> float | None:
+    """Fetch latest 扣非归母净利润同比增长 from THS financial data.
+
+    Column [4] = 扣非净利润同比增长 (core net profit YoY growth).
+    This is the REAL profit growth, excluding one-time gains.
+    """
+    try:
+        import akshare as ak
+        df = ak.stock_financial_abstract_ths(symbol=symbol)
+        if df is None or df.empty:
+            return None
+
+        dc = df.columns[0]
+        core_growth_col = df.columns[4]  # 扣非净利润同比增长
+
+        # THS data is oldest-first. Scan from newest (last row) backwards.
+        for idx in range(len(df) - 1, -1, -1):
+            raw = str(df.iloc[idx][core_growth_col])
+            val = _parse_pct(raw)
+            if val is not None:
+                return val
+
+        return None
+    except Exception:
         return None
 
 
@@ -440,7 +529,7 @@ def aggregate_to_sectors(peg_df: pd.DataFrame) -> pd.DataFrame:
     agg = peg_df.groupby("sector").agg(
         signal_score=("hybrid_signal", "mean"),
         peg_signal=("peg_signal", "mean"),
-        prg_signal=("prg_signal", "mean"),
+        prg_signal=("prg_score", "mean"),
         stock_count=("ts_code", "count"),
         avg_peg=("peg", "mean"),
         avg_growth=("consensus_growth", "mean"),
